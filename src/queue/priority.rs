@@ -338,9 +338,11 @@ mod tests {
             InjectorInner::Priority(p) => p.queue.clone(),
             _ => unreachable!(),
         };
+        let metrics = crate::pool::spawn::QueueCoreMetrics::new("priority_queue_test");
         let core = Arc::new(crate::pool::spawn::QueueCore::new(
             injecter,
             crate::pool::SchedConfig::default(),
+            metrics,
         ));
         let mut locals: Vec<_> = locals
             .into_iter()

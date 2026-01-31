@@ -4,14 +4,17 @@
 //! woken up when new tasks arrived and go to sleep when there are no
 //! tasks waiting to be handled.
 
+use crate::metrics;
 use crate::pool::SchedConfig;
 use crate::queue::{Extras, LocalQueue, Pop, TaskCell, TaskInjector, WithExtras};
 use fail::fail_point;
 use parking_lot_core::{FilterOp, ParkResult, ParkToken, UnparkToken};
+use prometheus::{local::LocalIntCounter, IntCounter};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc, Weak,
 };
+use std::time::{Duration, Instant};
 
 /// An usize is used to trace the threads that are working actively.
 /// To save additional memory and atomic operation, the number and
@@ -25,10 +28,47 @@ use std::sync::{
 const SHUTDOWN_BIT: usize = 1;
 const WORKER_COUNT_SHIFT: usize = 1;
 const WORKER_COUNT_BASE: usize = 2;
+const LOCAL_METRICS_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Checks if shutdown bit is set.
 pub fn is_shutdown(cnt: usize) -> bool {
     cnt & SHUTDOWN_BIT == SHUTDOWN_BIT
+}
+
+/// Metrics of the queue core.
+#[derive(Clone)]
+pub(crate) struct QueueCoreMetrics {
+    wake_out_of_polling: IntCounter,
+    wake_in_polling_local: IntCounter,
+    wake_in_polling_remote: IntCounter,
+}
+
+impl QueueCoreMetrics {
+    pub(crate) fn new(name: &str) -> QueueCoreMetrics {
+        let wake_out_of_polling = metrics::TASK_WAKE_EVENT
+            .get_metric_with_label_values(&[name, "out_of_polling"])
+            .unwrap();
+        let wake_in_polling_local = metrics::TASK_WAKE_EVENT
+            .get_metric_with_label_values(&[name, "in_polling_local"])
+            .unwrap();
+        let wake_in_polling_remote = metrics::TASK_WAKE_EVENT
+            .get_metric_with_label_values(&[name, "in_polling_remote"])
+            .unwrap();
+        QueueCoreMetrics {
+            wake_out_of_polling,
+            wake_in_polling_local,
+            wake_in_polling_remote,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn local(&self) -> LocalQueueMetrics {
+        LocalQueueMetrics {
+            wake_in_polling_local: self.wake_in_polling_local.local(),
+            wake_in_polling_remote: self.wake_in_polling_remote.local(),
+            last_flush: Instant::now(),
+        }
+    }
 }
 
 /// The core of queues.
@@ -39,14 +79,20 @@ pub(crate) struct QueueCore<T> {
     global_queue: TaskInjector<T>,
     active_workers: AtomicUsize,
     config: SchedConfig,
+    metrics: QueueCoreMetrics,
 }
 
 impl<T> QueueCore<T> {
-    pub fn new(global_queue: TaskInjector<T>, config: SchedConfig) -> QueueCore<T> {
+    pub fn new(
+        global_queue: TaskInjector<T>,
+        config: SchedConfig,
+        metrics: QueueCoreMetrics,
+    ) -> QueueCore<T> {
         QueueCore {
             global_queue,
             active_workers: AtomicUsize::new(config.max_thread_count << WORKER_COUNT_SHIFT),
             config,
+            metrics,
         }
     }
 
@@ -195,6 +241,11 @@ impl<T: TaskCell + Send> Remote<T> {
     pub(crate) fn stop(&self) {
         self.core.mark_shutdown(0);
     }
+
+    #[inline]
+    pub(crate) fn inc_wake_out_of_polling(&self) {
+        self.core.metrics.wake_out_of_polling.inc();
+    }
 }
 
 impl<T> Clone for Remote<T> {
@@ -241,6 +292,38 @@ impl<T> Clone for WeakRemote<T> {
 impl<T: Send> AssertSync for WeakRemote<T> {}
 impl<T: Send> AssertSend for WeakRemote<T> {}
 
+
+/// Local metrics for each local queue.
+pub(crate) struct LocalQueueMetrics {
+    wake_in_polling_local: LocalIntCounter,
+    wake_in_polling_remote: LocalIntCounter,
+    last_flush: Instant,
+}
+
+impl LocalQueueMetrics {
+    #[inline]
+    pub(crate) fn inc_wake_in_polling_local(&self) {
+        self.wake_in_polling_local.inc();
+    }
+
+    #[inline]
+    pub(crate) fn inc_wake_in_polling_remote(&self) {
+        self.wake_in_polling_remote.inc();
+    }
+
+    pub(crate) fn maybe_flush(&mut self) {
+        if self.last_flush.elapsed() >= LOCAL_METRICS_FLUSH_INTERVAL {
+            self.flush();
+        }
+    }
+
+    pub(crate) fn flush(&mut self) {
+        self.wake_in_polling_local.flush();
+        self.wake_in_polling_remote.flush();
+        self.last_flush = Instant::now();
+    }
+}
+
 /// Spawns tasks to the associated thread pool.
 ///
 /// It's different from `Remote` because it submits tasks to the local queue
@@ -250,14 +333,17 @@ pub struct Local<T> {
     id: usize,
     local_queue: LocalQueue<T>,
     core: Arc<QueueCore<T>>,
+    metrics: LocalQueueMetrics,
 }
 
 impl<T: TaskCell + Send> Local<T> {
     pub(crate) fn new(id: usize, local_queue: LocalQueue<T>, core: Arc<QueueCore<T>>) -> Local<T> {
+        let local_metrics = core.metrics.local();
         Local {
             id,
             local_queue,
             core,
+            metrics: local_metrics,
         }
     }
 
@@ -286,6 +372,24 @@ impl<T: TaskCell + Send> Local<T> {
 
     pub(crate) fn core(&self) -> &Arc<QueueCore<T>> {
         &self.core
+    }
+
+    #[inline]
+    pub(crate) fn inc_wake_in_polling_local(&self) {
+        self.metrics.inc_wake_in_polling_local();
+    }
+
+    #[inline]
+    pub(crate) fn inc_wake_in_polling_remote(&self) {
+        self.metrics.inc_wake_in_polling_remote();
+    }
+
+    pub(crate) fn maybe_flush_metrics(&mut self) {
+        self.metrics.maybe_flush();
+    }
+
+    pub(crate) fn flush_metrics(&mut self) {
+        self.metrics.flush();
     }
 
     pub(crate) fn pop(&mut self) -> Option<Pop<T>> {
@@ -346,9 +450,11 @@ pub fn build_spawn<T>(
 where
     T: TaskCell + Send,
 {
+    const TEST_QUEUE_NAME: &str = "yatp_pool_test";
     let queue_type = queue_type.into();
     let (global, locals) = crate::queue::build(queue_type, config.max_thread_count);
-    let core = Arc::new(QueueCore::new(global, config));
+    let metrics = QueueCoreMetrics::new(TEST_QUEUE_NAME);
+    let core = Arc::new(QueueCore::new(global, config, metrics));
     let l = locals
         .into_iter()
         .enumerate()

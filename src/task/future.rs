@@ -311,21 +311,25 @@ unsafe fn wake_task(task: Cow<'_, TaskCell>, reschedule: bool) {
             .remote
             .as_ref()
             .expect("core should exist!!!");
+        let local = ptr.get();
         let out_of_polling = ptr.get().is_null()
-            || !ptr::eq(Arc::as_ptr((*ptr.get()).core()), task_remote.as_core_ptr());
+            || !ptr::eq(Arc::as_ptr((*local).core()), task_remote.as_core_ptr());
         if out_of_polling {
             // It's out of polling process, has to be spawn to global queue.
             // It needs to clone to make it safe as it's unclear whether `self`
             // is still used inside method `spawn` after `TaskCell` is dropped.
             if let Some(remote) = task_remote.upgrade() {
+                remote.inc_wake_out_of_polling();
                 remote.spawn(task.clone().into_owned());
             }
         } else if reschedule {
             // It's requested explicitly to schedule to global queue.
-            (*ptr.get()).spawn_remote(task.into_owned());
+            (*local).inc_wake_in_polling_remote();
+            (*local).spawn_remote(task.into_owned());
         } else {
             // Otherwise spawns to local queue for best locality.
-            (*ptr.get()).spawn(task.into_owned());
+            (*local).inc_wake_in_polling_local();
+            (*local).spawn(task.into_owned());
         }
     })
 }

@@ -252,7 +252,8 @@ impl Builder {
                 .store(self.sched_config.min_thread_count, Ordering::SeqCst);
         }
         let (injector, local_queues) = queue::build(queue_type, self.sched_config.max_thread_count);
-        let core = Arc::new(QueueCore::new(injector, self.sched_config.clone()));
+        let metrics = crate::pool::spawn::QueueCoreMetrics::new(&self.name_prefix);
+        let core = Arc::new(QueueCore::new(injector, self.sched_config.clone(), metrics));
 
         (
             Remote::new(core.clone()),

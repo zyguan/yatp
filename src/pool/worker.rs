@@ -32,6 +32,7 @@ where
                 break;
             }
         }
+        self.local.flush_metrics();
         self.runner.pause(&mut self.local);
         let t = self.local.pop_or_sleep();
         self.runner.resume(&mut self.local);
@@ -46,7 +47,9 @@ where
                 None => continue,
             };
             self.runner.handle(&mut self.local, task.task_cell);
+            self.local.maybe_flush_metrics();
         }
+        self.local.flush_metrics();
         self.runner.end(&mut self.local);
 
         // Drain all futures in the queue

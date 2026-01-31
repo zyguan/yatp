@@ -71,6 +71,16 @@ lazy_static! {
     )
     .unwrap();
 
+    /// Total wakes grouped by wake type.
+    pub static ref TASK_WAKE_EVENT: IntCounterVec = IntCounterVec::new(
+        new_opts(
+            "yatp_task_wake_event_total",
+            "Total number of task wakes grouped by wake type",
+        ),
+        &["name", "type"]
+    )
+    .unwrap();
+
     static ref NAMESPACE: Mutex<Option<String>> = Mutex::new(None);
 }
 
